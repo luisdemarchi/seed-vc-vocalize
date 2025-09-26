@@ -15,6 +15,7 @@ output/
 # IDE
 .vscode/
 .idea/
+.venv*/
 
 # misc
 checkpoints/
