@@ -1,10 +1,17 @@
-# Optional environment for Python 3.13 (V2-focused)
-# Keep requirements.txt for Python 3.12 stable usage.
-# Notes:
-# - Prefer NumPy 2.x and SciPy >=1.14 for Python 3.13.
-# - PyTorch stable wheels for 3.13 may not be widely available yet; use nightly if needed.
-# - Exclude funasr/modelscope to reduce breakage on 3.13; V2 does not require them.
-# - Install ffmpeg on your system for pydub if you plan to load/export audio via AudioSegment.
+#############################################
+# Seed-VC - Python 3.13 (Colab/GPU friendly)
+#############################################
+
+# IMPORTANT:
+# - This file is tailored for Google Colab (Python 3.13) with GPU.
+# - It installs PyTorch with CUDA 12.1 wheels and all app dependencies.
+# - ffmpeg must be installed via apt on Colab: `!apt-get -y install ffmpeg libsndfile1`.
+
+# PyTorch CUDA 12.1 wheels
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
 
 # Core ML/runtime
 accelerate>=1.7.0
@@ -13,24 +20,12 @@ transformers==4.46.3
 huggingface-hub>=0.28.1
 einops==0.8.0
 
-# PyTorch (choose one set that matches your platform)
-# Linux/CUDA (example; adjust cuda version/index accordingly):
-# --extra-index-url https://download.pytorch.org/whl/cu129
-# torch --pre
-# torchvision --pre
-# torchaudio --pre
-#
-# CPU/macOS (nightly CPU example):
---extra-index-url https://download.pytorch.org/whl/nightly/cpu
-torch --pre
-torchvision --pre
-torchaudio --pre
-
 # Numeric & signal
 numpy>=2.1.0
 scipy>=1.14.0
 librosa==0.10.2.post1
 soundfile==0.12.1
+soxr
 
 # UI / server / utilities
 gradio==5.23.0
@@ -43,13 +38,9 @@ matplotlib
 # V1-specific (DAC)
 descript-audio-codec==1.0.0
 
-# Optional (only if you need them on 3.13 and wheels exist for your platform)
-# modelscope==1.18.1
-# funasr==1.1.5
-
-# Not required for V2 core but kept if your workflows rely on them
+# Not required for V2 core but commonly useful
 jiwer==3.0.3
 resemblyzer>=0.1.4
 
-# Windows-only optional optimization (ignored elsewhere)
+# (Optional) Windows-only optimization (ignored elsewhere)
 # triton-windows==3.2.0.post13
