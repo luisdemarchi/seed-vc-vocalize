@@ -19,17 +19,17 @@ Estamos continuamente melhorando a qualidade do modelo e adicionando mais recurs
 Consulte [EVAL.md](EVAL.md) para resultados de avaliação objetiva e comparações com outras baselines.
 
 ## Instalação📥
-Recomendado Python 3.10 no Windows, Mac Série M (Apple Silicon) ou Linux.
+Suporte mínimo: Python 3.12. Foco em GPU (CUDA).
 
-Windows e Linux:
-```bash
-pip install -r requirements.txt
-```
+- Se quiser rodar em ambiente local, use:
+  ```bash
+  pip install -r requirements.txt
+  ```
+  Observação: o `requirements.txt` NÃO instala `torch/torchvision/torchaudio`. Para GPU, recomendamos usar Docker abaixo (instala as wheels CUDA corretas). Para ambiente local fora de Docker, instale PyTorch CUDA manualmente conforme sua GPU/driver.
 
-Mac Série M:
-```bash
-pip install -r requirements-mac.txt
-```
+- Requisitos de sistema para I/O de áudio:
+  - `ffmpeg` para reamostragem/conversão (obrigatório se você usar as flags de pré-processamento abaixo).
+  - `libsndfile` (instalado automaticamente com `soundfile`).
 
 Requisitos de sistema para I/O de áudio:
 - `ffmpeg` para reamostragem/conversão (obrigatório se você usar as flags de pré-processamento abaixo).
@@ -88,17 +88,17 @@ Nota:
 - A V1 depende do Descript Audio Codec (DAC). Já incluímos `descript-audio-codec==1.0.0` em `requirements-py313.txt`.
 - Se habilitar as flags de pré-processamento, garanta `ffmpeg` instalado no sistema ou use a imagem Docker fornecida (já inclui ffmpeg).
 
-## Docker (Python 3.13, V1 padrão)
-Se preferir um runtime isolado e multiplataforma, use o Docker disponível neste repositório.
+## Docker (GPU, Python 3.12)
+Recomendado para produção/servidor com GPU. A imagem `Dockerfile.gpu` instala Python 3.12, PyTorch CUDA 12.1 (torch/vision/audio) e as dependências de projeto do `requirements.txt`.
 
-### Construir a imagem
+### Construir a imagem (GPU)
 ```bash
-docker build -t seed-vc:py313 .
+docker build -f Dockerfile.gpu -t seed-vc:gpu .
 ```
 
 ### Rodar inferência V1 (exemplo)
 ```bash
-docker run --rm -v "$PWD:/app" seed-vc:py313 \
+docker run --rm --gpus all -v "$PWD:/app" seed-vc:gpu \
   python inference.py \
     --source examples/source/source_s1.wav \
     --target examples/reference/s1p1.wav \
@@ -110,7 +110,7 @@ docker run --rm -v "$PWD:/app" seed-vc:py313 \
     --auto-f0-adjust False
 ```
 
-### docker compose
+### docker compose (GPU)
 ```bash
 docker compose build
 docker compose run --rm seed-vc \
@@ -126,8 +126,8 @@ docker compose run --rm seed-vc \
 ```
 
 Notas:
-- A imagem usa Python 3.13 e instala dependências via `requirements-py313.txt` (usa índice nightly CPU do PyTorch para 3.13).
-- Entrada/saída de áudio via `soundfile`/`libsndfile`; `ffmpeg` já vem instalado para reamostragem/conversão.
+- O projeto usa um ÚNICO `requirements.txt` compartilhado. As bibliotecas `torch/torchvision/torchaudio` são instaladas no `Dockerfile.gpu` com CUDA 12.1, e por isso não aparecem no `requirements.txt`.
+- Entrada/saída de áudio via `soundfile`/`libsndfile`; `ffmpeg` já vem instalado na imagem para reamostragem/conversão.
 - Ao montar o repositório com `-v "$PWD:/app"`, os arquivos gerados aparecem no seu diretório local `output/`.
 
 Da mesma forma, para usar o modelo V2, você pode executar:

@@ -1,4 +1,0 @@
-# Optional dependencies for serverless handler/runtime
-runpod
-
-

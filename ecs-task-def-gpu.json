@@ -1,0 +1,63 @@
+{
+  "family": "seed-vc-vocalize-gpu",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["EC2"],
+  "cpu": "4096",
+  "memory": "16384",
+  "taskRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<YourTaskRole>",
+  "executionRoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/<YourTaskExecutionRole>",
+  "containerDefinitions": [
+    {
+      "name": "seed-vc-vocalize",
+      "image": "<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/seed-vc-vocalize:latest",
+      "essential": true,
+      "environment": [
+        { "name": "HF_HOME", "value": "/app/checkpoints/hf_cache" },
+        { "name": "HF_HUB_CACHE", "value": "/app/checkpoints/hf_cache" },
+        { "name": "PYTHONUNBUFFERED", "value": "1" }
+      ],
+      "resourceRequirements": [
+        { "type": "GPU", "value": "1" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/seed-vc-vocalize",
+          "awslogs-region": "<REGION>",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "linuxParameters": {
+        "initProcessEnabled": true
+      },
+      "ulimits": [
+        { "name": "memlock", "softLimit": -1, "hardLimit": -1 },
+        { "name": "nofile", "softLimit": 65536, "hardLimit": 65536 }
+      ],
+      "command": [
+        "bash",
+        "-lc",
+        "python inference.py --target examples/reference/s1p1.wav --output /data/output --diffusion-steps 30 --inference-cfg-rate 0.7 --length-adjust 1.0 --f0-condition False --auto-f0-adjust False --preprocess-source-ffmpeg True --preprocess-target-ffmpeg True --use-ref-cache True --source-glob \"/data/sources/*.wav\""
+      ],
+      "mountPoints": [
+        {
+          "sourceVolume": "data",
+          "containerPath": "/data",
+          "readOnly": false
+        }
+      ],
+      "workingDirectory": "/app"
+    }
+  ],
+  "volumes": [
+    {
+      "name": "data",
+      "host": {
+        "sourcePath": "/var/lib/seed-vc-data"
+      }
+    }
+  ],
+  "tags": [
+    { "key": "project", "value": "seed-vc-vocalize" }
+  ]
+}

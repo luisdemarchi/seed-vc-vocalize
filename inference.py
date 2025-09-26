@@ -12,6 +12,7 @@ import soundfile as sf
 import subprocess
 import tempfile
 import atexit
+import glob
 
 warnings.simplefilter('ignore')
 
@@ -22,7 +23,7 @@ from modules.commons import *
 import time
 
 import torchaudio
-import librosa
+import soxr
 from modules.commons import str2bool
 
 from hf_utils import load_custom_model_from_hf
@@ -32,6 +33,14 @@ from hf_utils import load_custom_model_from_hf
 # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
     device = torch.device("cuda")
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 elif torch.backends.mps.is_available():
     device = torch.device("mps")
 else:
@@ -102,7 +111,10 @@ def load_models(args):
     if vocoder_type == 'bigvgan':
         from modules.bigvgan import bigvgan
         bigvgan_name = model_params.vocoder.name
-        bigvgan_model = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=False)
+        bigvgan_model = bigvgan.BigVGAN.from_pretrained(
+            bigvgan_name,
+            use_cuda_kernel=True if device.type == "cuda" else False
+        )
         # remove weight norm in the model and set to eval mode
         bigvgan_model.remove_weight_norm()
         bigvgan_model = bigvgan_model.eval().to(device)
@@ -145,7 +157,8 @@ def load_models(args):
         def semantic_fn(waves_16k):
             ori_inputs = whisper_feature_extractor([waves_16k.squeeze(0).cpu().numpy()],
                                                    return_tensors="pt",
-                                                   return_attention_mask=True)
+                                                   return_attention_mask=True,
+                                                   sampling_rate=16000)
             ori_input_features = whisper_model._mask_input_features(
                 ori_inputs.input_features, attention_mask=ori_inputs.attention_mask).to(device)
             with torch.no_grad():
@@ -267,6 +280,7 @@ def main(args):
 
     source = args.source
     target_name = args.target
+    target_basename = os.path.basename(args.target)
 
     # Optional: ffmpeg-based preprocessing to 22.05 kHz mono inside Python
     tmp_paths = []
@@ -299,7 +313,8 @@ def main(args):
         tmp_paths.append(tmp_path)
         return tmp_path
 
-    if getattr(args, "preprocess_source_ffmpeg", False):
+    is_batch_mode = bool(getattr(args, "source_glob", None) or getattr(args, "sources_file", None))
+    if getattr(args, "preprocess_source_ffmpeg", False) and not is_batch_mode:
         source = _ffmpeg_resample(source, out_sr=22050, mono=True)
     if getattr(args, "preprocess_target_ffmpeg", False):
         target_name = _ffmpeg_resample(target_name, out_sr=22050, mono=True)
@@ -312,9 +327,11 @@ def main(args):
         if data.ndim > 1:
             data = data.mean(axis=1)
         if file_sr != target_sr:
-            data = librosa.resample(data, orig_sr=file_sr, target_sr=target_sr)
+            # Use high-quality resampling via soxr (Python 3.13 compatible)
+            data = soxr.resample(data, file_sr, target_sr)
         return data
-    source_audio = _load_wave(source, sr)
+    if not is_batch_mode:
+        source_audio = _load_wave(source, sr)
     ref_audio = _load_wave(target_name, sr)
 
     sr = 22050 if not f0_condition else 44100
@@ -324,54 +341,101 @@ def main(args):
     overlap_wave_len = overlap_frame_len * hop_length
 
     # Process audio
-    source_audio = torch.tensor(source_audio).unsqueeze(0).float().to(device)
-    ref_audio = torch.tensor(ref_audio[:sr * 25]).unsqueeze(0).float().to(device)
+    if not is_batch_mode:
+        source_audio = torch.tensor(source_audio).unsqueeze(0).float().to(device)
+
+    # Simple reference cache (single NPZ per reference file name)
+    use_ref_cache = getattr(args, "use_ref_cache", False)
+    ref_cache_dir = getattr(args, "ref_cache_dir", None)
+    cache_hit = False
+    cached = {}
+    if use_ref_cache and ref_cache_dir:
+        os.makedirs(ref_cache_dir, exist_ok=True)
+        cache_path = os.path.join(ref_cache_dir, f"{target_basename}.npz")
+        if os.path.exists(cache_path):
+            try:
+                npz = np.load(cache_path, allow_pickle=False)
+                cached = {k: npz[k] for k in npz.files}
+                cache_hit = True
+            except Exception:
+                cache_hit = False
+
+    # Prepare reference tensors, loading from cache if available
+    if cache_hit and "ref_audio" in cached:
+        ref_audio_np = cached["ref_audio"].astype(np.float32)
+    else:
+        ref_audio_np = ref_audio.astype(np.float32)
+
+    ref_audio = torch.from_numpy(ref_audio_np[:sr * 25]).unsqueeze(0).float().to(device)
 
     time_vc_start = time.time()
-    # Resample
-    converted_waves_16k = torchaudio.functional.resample(source_audio, sr, 16000)
-    # if source audio less than 30 seconds, whisper can handle in one forward
-    if converted_waves_16k.size(-1) <= 16000 * 30:
-        S_alt = semantic_fn(converted_waves_16k)
+    if not is_batch_mode:
+        # Resample
+        converted_waves_16k = torchaudio.functional.resample(source_audio, sr, 16000)
+        # if source audio less than 30 seconds, whisper can handle in one forward
+        if converted_waves_16k.size(-1) <= 16000 * 30:
+            S_alt = semantic_fn(converted_waves_16k)
+        else:
+            overlapping_time = 5  # 5 seconds
+            S_alt_list = []
+            buffer = None
+            traversed_time = 0
+            while traversed_time < converted_waves_16k.size(-1):
+                if buffer is None:  # first chunk
+                    chunk = converted_waves_16k[:, traversed_time:traversed_time + 16000 * 30]
+                else:
+                    chunk = torch.cat(
+                        [buffer, converted_waves_16k[:, traversed_time:traversed_time + 16000 * (30 - overlapping_time)]],
+                        dim=-1)
+                S_alt = semantic_fn(chunk)
+                if traversed_time == 0:
+                    S_alt_list.append(S_alt)
+                else:
+                    S_alt_list.append(S_alt[:, 50 * overlapping_time:])
+                buffer = chunk[:, -16000 * overlapping_time:]
+                traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
+            S_alt = torch.cat(S_alt_list, dim=1)
+
+    if cache_hit and "ori_waves_16k" in cached:
+        ori_waves_16k = torch.from_numpy(cached["ori_waves_16k"].astype(np.float32)).unsqueeze(0).to(device)
     else:
-        overlapping_time = 5  # 5 seconds
-        S_alt_list = []
-        buffer = None
-        traversed_time = 0
-        while traversed_time < converted_waves_16k.size(-1):
-            if buffer is None:  # first chunk
-                chunk = converted_waves_16k[:, traversed_time:traversed_time + 16000 * 30]
-            else:
-                chunk = torch.cat(
-                    [buffer, converted_waves_16k[:, traversed_time:traversed_time + 16000 * (30 - overlapping_time)]],
-                    dim=-1)
-            S_alt = semantic_fn(chunk)
-            if traversed_time == 0:
-                S_alt_list.append(S_alt)
-            else:
-                S_alt_list.append(S_alt[:, 50 * overlapping_time:])
-            buffer = chunk[:, -16000 * overlapping_time:]
-            traversed_time += 30 * 16000 if traversed_time == 0 else chunk.size(-1) - 16000 * overlapping_time
-        S_alt = torch.cat(S_alt_list, dim=1)
+        ori_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
 
-    ori_waves_16k = torchaudio.functional.resample(ref_audio, sr, 16000)
-    S_ori = semantic_fn(ori_waves_16k)
+    if cache_hit and "S_ori" in cached:
+        S_ori = torch.from_numpy(cached["S_ori"].astype(np.float32)).to(device)
+    else:
+        S_ori = semantic_fn(ori_waves_16k)
 
-    mel = mel_fn(source_audio.to(device).float())
-    mel2 = mel_fn(ref_audio.to(device).float())
+    if not is_batch_mode:
+        mel = mel_fn(source_audio.to(device).float())
+    if cache_hit and "mel2" in cached:
+        mel2 = torch.from_numpy(cached["mel2"].astype(np.float32)).to(device)
+    else:
+        mel2 = mel_fn(ref_audio.to(device).float())
 
-    target_lengths = torch.LongTensor([int(mel.size(2) * length_adjust)]).to(mel.device)
-    target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
+    if not is_batch_mode:
+        target_lengths = torch.LongTensor([int(mel.size(2) * length_adjust)]).to(mel.device)
+    # Reference prompt_condition/lengths (cache-aware)
+    if cache_hit and "target2_lengths" in cached:
+        target2_lengths = torch.LongTensor([int(cached["target2_lengths"][()])]).to(mel2.device)
+    else:
+        target2_lengths = torch.LongTensor([mel2.size(2)]).to(mel2.device)
 
-    feat2 = torchaudio.compliance.kaldi.fbank(ori_waves_16k,
-                                              num_mel_bins=80,
-                                              dither=0,
-                                              sample_frequency=16000)
-    feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
-    style2 = campplus_model(feat2.unsqueeze(0))
+    if cache_hit and "style2" in cached:
+        style2 = torch.from_numpy(cached["style2"].astype(np.float32)).to(device)
+    else:
+        feat2 = torchaudio.compliance.kaldi.fbank(ori_waves_16k,
+                                                  num_mel_bins=80,
+                                                  dither=0,
+                                                  sample_frequency=16000)
+        feat2 = feat2 - feat2.mean(dim=0, keepdim=True)
+        style2 = campplus_model(feat2.unsqueeze(0))
 
     if f0_condition:
-        F0_ori = f0_fn(ori_waves_16k[0], thred=0.03)
+        if cache_hit and "F0_ori" in cached:
+            F0_ori = cached["F0_ori"].astype(np.float32)
+        else:
+            F0_ori = f0_fn(ori_waves_16k[0], thred=0.03)
         F0_alt = f0_fn(converted_waves_16k[0], thred=0.03)
 
         F0_ori = torch.from_numpy(F0_ori).to(device)[None]
@@ -399,60 +463,197 @@ def main(args):
         shifted_f0_alt = None
 
     # Length regulation
-    cond, _, codes, commitment_loss, codebook_loss = model.length_regulator(S_alt, ylens=target_lengths,
-                                                                                       n_quantizers=3,
-                                                                                       f0=shifted_f0_alt)
-    prompt_condition, _, codes, commitment_loss, codebook_loss = model.length_regulator(S_ori,
-                                                                                       ylens=target2_lengths,
-                                                                                       n_quantizers=3,
-                                                                                       f0=F0_ori)
+    if not is_batch_mode:
+        cond, _, codes, commitment_loss, codebook_loss = model.length_regulator(S_alt, ylens=target_lengths,
+                                                                                           n_quantizers=3,
+                                                                                           f0=shifted_f0_alt)
+    if cache_hit and "prompt_condition" in cached:
+        prompt_condition = torch.from_numpy(cached["prompt_condition"].astype(np.float32)).to(device)
+    else:
+        prompt_condition, _, codes, commitment_loss, codebook_loss = model.length_regulator(S_ori,
+                                                                                           ylens=target2_lengths,
+                                                                                           n_quantizers=3,
+                                                                                           f0=F0_ori)
 
     max_source_window = max_context_window - mel2.size(2)
     # split source condition (cond) into chunks
     processed_frames = 0
     generated_wave_chunks = []
-    # generate chunk by chunk and stream the output
-    while processed_frames < cond.size(1):
-        chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
-        is_last_chunk = processed_frames + max_source_window >= cond.size(1)
-        cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
-        with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
-            # Voice Conversion
-            vc_target = model.cfm.inference(cat_condition,
-                                                       torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
-                                                       mel2, style2, None, diffusion_steps,
-                                                       inference_cfg_rate=inference_cfg_rate)
-            vc_target = vc_target[:, :, mel2.size(-1):]
-        vc_wave = vocoder_fn(vc_target.float()).squeeze()
-        vc_wave = vc_wave[None, :]
-        if processed_frames == 0:
-            if is_last_chunk:
-                output_wave = vc_wave[0].cpu().numpy()
-                generated_wave_chunks.append(output_wave)
-                break
-            output_wave = vc_wave[0, :-overlap_wave_len].cpu().numpy()
-            generated_wave_chunks.append(output_wave)
-            previous_chunk = vc_wave[0, -overlap_wave_len:]
-            processed_frames += vc_target.size(2) - overlap_frame_len
-        elif is_last_chunk:
-            output_wave = crossfade(previous_chunk.cpu().numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
-            generated_wave_chunks.append(output_wave)
-            processed_frames += vc_target.size(2) - overlap_frame_len
-            break
+    # Batch handling: build sources list
+    sources_list = []
+    if getattr(args, "source_glob", None):
+        sources_list = sorted(glob.glob(args.source_glob))
+    elif getattr(args, "sources_file", None):
+        try:
+            with open(args.sources_file, 'r') as f:
+                sources_list = [line.strip() for line in f if line.strip()]
+        except Exception:
+            sources_list = []
+    if not sources_list:
+        sources_list = [source]
+
+    # Function to run VC for one source, reusing reference artifacts
+    def run_single_source(src_path: str):
+        nonlocal target_name, prompt_condition, mel2, style2
+        # Load and preprocess source
+        try:
+            src_in = src_path
+            if getattr(args, "preprocess_source_ffmpeg", False):
+                src_in = _ffmpeg_resample(src_in, out_sr=22050, mono=True)
+            src_np = _load_wave(src_in, sr)
+        except Exception as e:
+            print(f"[warn] skipping '{src_path}': {e}")
+            return None
+        src_tensor = torch.tensor(src_np).unsqueeze(0).float().to(device)
+        conv_16k = torchaudio.functional.resample(src_tensor, sr, 16000)
+        # Build S_alt (semantic for source)
+        if conv_16k.size(-1) <= 16000 * 30:
+            S_alt_local = semantic_fn(conv_16k)
         else:
-            output_wave = crossfade(previous_chunk.cpu().numpy(), vc_wave[0, :-overlap_wave_len].cpu().numpy(),
-                                    overlap_wave_len)
-            generated_wave_chunks.append(output_wave)
-            previous_chunk = vc_wave[0, -overlap_wave_len:]
-            processed_frames += vc_target.size(2) - overlap_frame_len
-    vc_wave = torch.tensor(np.concatenate(generated_wave_chunks))[None, :].float()
+            overlapping_time = 5
+            S_alt_list_local = []
+            buffer_local = None
+            traversed_time_local = 0
+            while traversed_time_local < conv_16k.size(-1):
+                if buffer_local is None:
+                    chunk_local = conv_16k[:, traversed_time_local:traversed_time_local + 16000 * 30]
+                else:
+                    chunk_local = torch.cat([
+                        buffer_local,
+                        conv_16k[:, traversed_time_local:traversed_time_local + 16000 * (30 - overlapping_time)]
+                    ], dim=-1)
+                S_alt_piece = semantic_fn(chunk_local)
+                if traversed_time_local == 0:
+                    S_alt_list_local.append(S_alt_piece)
+                else:
+                    S_alt_list_local.append(S_alt_piece[:, 50 * overlapping_time:])
+                buffer_local = chunk_local[:, -16000 * overlapping_time:]
+                traversed_time_local += 30 * 16000 if traversed_time_local == 0 else chunk_local.size(-1) - 16000 * overlapping_time
+            S_alt_local = torch.cat(S_alt_list_local, dim=1)
+
+        # target lengths for source
+        mel_src = mel_fn(src_tensor.to(device).float())
+        tgt_lengths_local = torch.LongTensor([int(mel_src.size(2) * length_adjust)]).to(mel_src.device)
+        cond_local, _, _, _, _ = model.length_regulator(S_alt_local, ylens=tgt_lengths_local,
+                                                        n_quantizers=3, f0=None if not f0_condition else shifted_f0_alt)
+
+        # Generate chunk by chunk
+        processed_frames_local = 0
+        generated_chunks = []
+        prev_chunk = None
+        while processed_frames_local < cond_local.size(1):
+            chunk_cond = cond_local[:, processed_frames_local:processed_frames_local + max_source_window]
+            is_last_chunk = processed_frames_local + max_source_window >= cond_local.size(1)
+            cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
+            with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
+                vc_target = model.cfm.inference(cat_condition,
+                                                torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
+                                                mel2, style2, None, diffusion_steps,
+                                                inference_cfg_rate=inference_cfg_rate)
+                vc_target = vc_target[:, :, mel2.size(-1):]
+            vc_wave_local = vocoder_fn(vc_target.float()).squeeze()[None, :]
+            if processed_frames_local == 0:
+                if is_last_chunk:
+                    generated_chunks.append(vc_wave_local[0].cpu().numpy())
+                    break
+                generated_chunks.append(vc_wave_local[0, :-overlap_wave_len].cpu().numpy())
+                prev_chunk = vc_wave_local[0, -overlap_wave_len:]
+                processed_frames_local += vc_target.size(2) - overlap_frame_len
+            elif is_last_chunk:
+                out = crossfade(prev_chunk.cpu().numpy(), vc_wave_local[0].cpu().numpy(), overlap_wave_len)
+                generated_chunks.append(out)
+                processed_frames_local += vc_target.size(2) - overlap_frame_len
+                break
+            else:
+                out = crossfade(prev_chunk.cpu().numpy(), vc_wave_local[0, :-overlap_wave_len].cpu().numpy(), overlap_wave_len)
+                generated_chunks.append(out)
+                prev_chunk = vc_wave_local[0, -overlap_wave_len:]
+                processed_frames_local += vc_target.size(2) - overlap_frame_len
+
+        vc_wave_local = torch.tensor(np.concatenate(generated_chunks))[None, :].float()
+        src_name = os.path.basename(src_path).split(".")[0]
+        tgt_name = os.path.basename(target_name).split(".")[0]
+        os.makedirs(args.output, exist_ok=True)
+        torchaudio.save(os.path.join(args.output, f"vc_{src_name}_{tgt_name}_{length_adjust}_{diffusion_steps}_{inference_cfg_rate}.wav"), vc_wave_local.cpu(), sr)
+        return os.path.join(args.output, f"vc_{src_name}_{tgt_name}_{length_adjust}_{diffusion_steps}_{inference_cfg_rate}.wav")
+
+    # If not batching, continue with the already computed cond path
+    if len(sources_list) == 1 and sources_list[0] == source:
+        # generate chunk by chunk and stream the output
+        while processed_frames < cond.size(1):
+            chunk_cond = cond[:, processed_frames:processed_frames + max_source_window]
+            is_last_chunk = processed_frames + max_source_window >= cond.size(1)
+            cat_condition = torch.cat([prompt_condition, chunk_cond], dim=1)
+            with torch.autocast(device_type=device.type, dtype=torch.float16 if fp16 else torch.float32):
+                # Voice Conversion
+                vc_target = model.cfm.inference(cat_condition,
+                                               torch.LongTensor([cat_condition.size(1)]).to(mel2.device),
+                                               mel2, style2, None, diffusion_steps,
+                                               inference_cfg_rate=inference_cfg_rate)
+                vc_target = vc_target[:, :, mel2.size(-1):]
+            vc_wave = vocoder_fn(vc_target.float()).squeeze()
+            vc_wave = vc_wave[None, :]
+            if processed_frames == 0:
+                if is_last_chunk:
+                    output_wave = vc_wave[0].cpu().numpy()
+                    generated_wave_chunks.append(output_wave)
+                    break
+                output_wave = vc_wave[0, :-overlap_wave_len].cpu().numpy()
+                generated_wave_chunks.append(output_wave)
+                previous_chunk = vc_wave[0, -overlap_wave_len:]
+                processed_frames += vc_target.size(2) - overlap_frame_len
+            elif is_last_chunk:
+                output_wave = crossfade(previous_chunk.cpu().numpy(), vc_wave[0].cpu().numpy(), overlap_wave_len)
+                generated_wave_chunks.append(output_wave)
+                processed_frames += vc_target.size(2) - overlap_frame_len
+                break
+            else:
+                output_wave = crossfade(previous_chunk.cpu().numpy(), vc_wave[0, :-overlap_wave_len].cpu().numpy(),
+                                        overlap_wave_len)
+                generated_wave_chunks.append(output_wave)
+                previous_chunk = vc_wave[0, -overlap_wave_len:]
+                processed_frames += vc_target.size(2) - overlap_frame_len
+        vc_wave = torch.tensor(np.concatenate(generated_wave_chunks))[None, :].float()
+    else:
+        # batch over sources_list
+        ok = 0
+        for src in sources_list:
+            out = run_single_source(src)
+            if out:
+                ok += 1
+        print(f"Batch completed: {ok}/{len(sources_list)} files converted.")
+        # No single vc_wave to report RTF for batch; skip RTF print in this branch
     time_vc_end = time.time()
-    print(f"RTF: {(time_vc_end - time_vc_start) / vc_wave.size(-1) * sr}")
+    if 'vc_wave' in locals():
+        print(f"RTF: {(time_vc_end - time_vc_start) / vc_wave.size(-1) * sr}")
+
+    # Save cache if enabled and not hit
+    if use_ref_cache and ref_cache_dir and not cache_hit:
+        try:
+            to_save = {
+                "ref_audio": ref_audio.cpu().squeeze(0).numpy().astype(np.float32),
+                "ori_waves_16k": ori_waves_16k.cpu().squeeze(0).numpy().astype(np.float32),
+                "S_ori": S_ori.cpu().numpy().astype(np.float32),
+                "mel2": mel2.cpu().numpy().astype(np.float32),
+                "style2": style2.cpu().numpy().astype(np.float32),
+            }
+            # Save prompt_condition and target2_lengths as well
+            if 'prompt_condition' in locals():
+                to_save["prompt_condition"] = prompt_condition.cpu().numpy().astype(np.float32)
+            if 'target2_lengths' in locals():
+                to_save["target2_lengths"] = np.array(int(target2_lengths.item()), dtype=np.int64)
+            if f0_condition and F0_ori is not None:
+                to_save["F0_ori"] = np.asarray(F0_ori, dtype=np.float32)
+            cache_path = os.path.join(ref_cache_dir, f"{target_basename}.npz")
+            np.savez(cache_path, **to_save)
+        except Exception:
+            pass
 
     source_name = os.path.basename(source).split(".")[0]
     target_name = os.path.basename(target_name).split(".")[0]
-    os.makedirs(args.output, exist_ok=True)
-    torchaudio.save(os.path.join(args.output, f"vc_{source_name}_{target_name}_{length_adjust}_{diffusion_steps}_{inference_cfg_rate}.wav"), vc_wave.cpu(), sr)
+    if 'vc_wave' in locals():
+        os.makedirs(args.output, exist_ok=True)
+        torchaudio.save(os.path.join(args.output, f"vc_{source_name}_{target_name}_{length_adjust}_{diffusion_steps}_{inference_cfg_rate}.wav"), vc_wave.cpu(), sr)
 
 
 if __name__ == "__main__":
@@ -474,5 +675,15 @@ if __name__ == "__main__":
                         help="If true, resample source to 22.05kHz mono via ffmpeg before inference")
     parser.add_argument("--preprocess-target-ffmpeg", type=str2bool, default=False,
                         help="If true, resample target to 22.05kHz mono via ffmpeg before inference")
+    # Simple reference cache controls
+    parser.add_argument("--ref-cache-dir", type=str, default="./cache",
+                        help="Directory to store/load single-file NPZ cache for the reference (keyed by reference filename)")
+    parser.add_argument("--use-ref-cache", type=str2bool, default=False,
+                        help="If true, load cached reference if present; if missing, compute and save it")
+    # Batch helpers (optional)
+    parser.add_argument("--source-glob", type=str, default=None,
+                        help="Glob pattern for batch processing multiple source files (e.g., 'examples/source/*.wav')")
+    parser.add_argument("--sources-file", type=str, default=None,
+                        help="Text file listing source paths (one per line) for batch processing")
     args = parser.parse_args()
     main(args)
