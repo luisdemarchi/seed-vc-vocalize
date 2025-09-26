@@ -76,6 +76,48 @@ where:
 - `config` is the path to the model config if you have trained or fine-tuned your own model, leave to blank to auto-download default config from huggingface  
 - `fp16` is the flag to use float16 inference, default is True
 
+## Docker (Python 3.13, V1 default)
+If you prefer a cross-platform, isolated runtime, use the provided Docker setup.
+
+### Build image
+```bash
+docker build -t seed-vc:py313 .
+```
+
+### Run V1 inference (example)
+```bash
+docker run --rm -v "$PWD:/app" seed-vc:py313 \
+  python inference.py \
+    --source examples/source/source_s1.wav \
+    --target examples/reference/s1p1.wav \
+    --output output \
+    --diffusion-steps 30 \
+    --inference-cfg-rate 0.7 \
+    --length-adjust 1.0 \
+    --f0-condition False \
+    --auto-f0-adjust False
+```
+
+### docker compose
+```bash
+docker compose build
+docker compose run --rm seed-vc \
+  python inference.py \
+    --source examples/source/source_s1.wav \
+    --target examples/reference/s1p1.wav \
+    --output output \
+    --diffusion-steps 30 \
+    --inference-cfg-rate 0.7 \
+    --length-adjust 1.0 \
+    --f0-condition False \
+    --auto-f0-adjust False
+```
+
+Notes:
+- The image is based on Python 3.13 and installs dependencies from `requirements-py313.txt` (uses PyTorch nightly CPU index for 3.13).
+- Audio I/O handled by `soundfile`/`libsndfile`; `ffmpeg` is preinstalled for resampling/conversions.
+- Mounting the repo with `-v "$PWD:/app"` ensures outputs appear under your local `output/` directory.
+
 Similarly, to use V2 model, you can run:
 ```bash
 python inference_v2.py --source <source-wav>

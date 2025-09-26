@@ -8,6 +8,7 @@ import warnings
 import argparse
 import torch
 import yaml
+import soundfile as sf
 
 warnings.simplefilter('ignore')
 
@@ -266,8 +267,16 @@ def main(args):
     diffusion_steps = args.diffusion_steps
     length_adjust = args.length_adjust
     inference_cfg_rate = args.inference_cfg_rate
-    source_audio = librosa.load(source, sr=sr)[0]
-    ref_audio = librosa.load(target_name, sr=sr)[0]
+    # Load audio with soundfile and resample to sr to avoid audioread/aifc issues on Python 3.13
+    def _load_wave(path: str, target_sr: int):
+        data, file_sr = sf.read(path, dtype='float32', always_2d=False)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if file_sr != target_sr:
+            data = librosa.resample(data, orig_sr=file_sr, target_sr=target_sr)
+        return data
+    source_audio = _load_wave(source, sr)
+    ref_audio = _load_wave(target_name, sr)
 
     sr = 22050 if not f0_condition else 44100
     hop_length = 256 if not f0_condition else 512

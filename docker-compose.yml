@@ -1,0 +1,19 @@
+version: "3.9"
+
+services:
+  seed-vc:
+    build: .
+    image: seed-vc:py313
+    working_dir: /app
+    volumes:
+      - ./:/app
+    # Default command prints a message. Override with `docker compose run seed-vc <cmd>`.
+    command: ["python", "-c", "print('Seed-VC Python 3.13 container ready. Override command to run inference.')"]
+    environment:
+      - HF_HUB_CACHE=/app/checkpoints/hf_cache
+    # Uncomment to limit CPU/RAM if desired
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '4'
+    #       memory: 8g
