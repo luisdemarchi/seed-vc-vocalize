@@ -4,6 +4,7 @@ import torchaudio
 import numpy as np
 from pydub import AudioSegment
 from hf_utils import load_custom_model_from_hf
+import soundfile as sf
 
 DEFAULT_REPO_ID = "Plachta/Seed-VC"
 DEFAULT_CFM_CHECKPOINT = "v2/cfm_small.pth"
@@ -51,6 +52,17 @@ class VoiceConversionWrapper(torch.nn.Module):
         self.dit_max_context_len = 30  # in seconds
         self.ar_max_content_len = 1500  # in num of narrow tokens
         self.compile_len = 87 * self.dit_max_context_len
+
+    def _load_wave(self, path: str, target_sr: int) -> np.ndarray:
+        """Load audio using soundfile to avoid audioread aifc import on Python 3.13.
+        Returns mono float32 numpy array resampled to target_sr.
+        """
+        data, sr = sf.read(path, dtype='float32', always_2d=False)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        if sr != target_sr:
+            data = librosa.resample(data, orig_sr=sr, target_sr=target_sr)
+        return data
 
     def forward_cfm(self, content_indices_wide, content_lens, mels, mel_lens, style_vectors):
         device = content_indices_wide.device
@@ -344,8 +356,8 @@ class VoiceConversionWrapper(torch.nn.Module):
             device: torch.device = torch.device("cpu"),
             dtype: torch.dtype = torch.float32,
     ):
-        source_wave = librosa.load(source_audio_path, sr=self.sr)[0]
-        target_wave = librosa.load(target_audio_path, sr=self.sr)[0]
+        source_wave = self._load_wave(source_audio_path, self.sr)
+        target_wave = self._load_wave(target_audio_path, self.sr)
         source_wave_tensor = torch.tensor(source_wave).unsqueeze(0).to(device)
         target_wave_tensor = torch.tensor(target_wave).unsqueeze(0).to(device)
 
@@ -404,8 +416,8 @@ class VoiceConversionWrapper(torch.nn.Module):
             device: torch.device = torch.device("cpu"),
             dtype: torch.dtype = torch.float32,
     ):
-        source_wave = librosa.load(source_audio_path, sr=self.sr)[0]
-        target_wave = librosa.load(target_audio_path, sr=self.sr)[0]
+        source_wave = self._load_wave(source_audio_path, self.sr)
+        target_wave = self._load_wave(target_audio_path, self.sr)
         source_wave_tensor = torch.tensor(source_wave).unsqueeze(0).to(device)
         target_wave_tensor = torch.tensor(target_wave).unsqueeze(0).to(device)
 
@@ -531,8 +543,8 @@ class VoiceConversionWrapper(torch.nn.Module):
             If stream_output is False, returns the full audio as a numpy array
         """
         # Load audio
-        source_wave = librosa.load(source_audio_path, sr=self.sr)[0]
-        target_wave = librosa.load(target_audio_path, sr=self.sr)[0]
+        source_wave = self._load_wave(source_audio_path, self.sr)
+        target_wave = self._load_wave(target_audio_path, self.sr)
         
         # Limit target audio to 25 seconds
         target_wave = target_wave[:self.sr * (self.dit_max_context_len - 5)]
