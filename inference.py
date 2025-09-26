@@ -9,6 +9,9 @@ import argparse
 import torch
 import yaml
 import soundfile as sf
+import subprocess
+import tempfile
+import atexit
 
 warnings.simplefilter('ignore')
 
@@ -264,6 +267,42 @@ def main(args):
 
     source = args.source
     target_name = args.target
+
+    # Optional: ffmpeg-based preprocessing to 22.05 kHz mono inside Python
+    tmp_paths = []
+    def _cleanup_tmp():
+        for p in tmp_paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+    atexit.register(_cleanup_tmp)
+
+    def _ffmpeg_resample(in_path: str, out_sr: int = 22050, mono: bool = True) -> str:
+        if not os.path.exists(in_path):
+            raise FileNotFoundError(f"ffmpeg preprocessing input not found: {in_path}")
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        cmd = [
+            "ffmpeg", "-y", "-i", in_path,
+            "-ac", "1" if mono else "2",
+            "-ar", str(out_sr),
+            tmp_path,
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except subprocess.CalledProcessError as e:
+            err = e.stderr.decode(errors="ignore") if isinstance(e.stderr, (bytes, bytearray)) else str(e)
+            raise RuntimeError(f"ffmpeg failed while preprocessing {in_path}:\n{err}") from e
+        tmp_paths.append(tmp_path)
+        return tmp_path
+
+    if getattr(args, "preprocess_source_ffmpeg", False):
+        source = _ffmpeg_resample(source, out_sr=22050, mono=True)
+    if getattr(args, "preprocess_target_ffmpeg", False):
+        target_name = _ffmpeg_resample(target_name, out_sr=22050, mono=True)
     diffusion_steps = args.diffusion_steps
     length_adjust = args.length_adjust
     inference_cfg_rate = args.inference_cfg_rate
@@ -430,5 +469,10 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint", type=str, help="Path to the checkpoint file", default=None)
     parser.add_argument("--config", type=str, help="Path to the config file", default=None)
     parser.add_argument("--fp16", type=str2bool, default=True)
+    # New: optional ffmpeg preprocessing flags
+    parser.add_argument("--preprocess-source-ffmpeg", type=str2bool, default=False,
+                        help="If true, resample source to 22.05kHz mono via ffmpeg before inference")
+    parser.add_argument("--preprocess-target-ffmpeg", type=str2bool, default=False,
+                        help="If true, resample target to 22.05kHz mono via ffmpeg before inference")
     args = parser.parse_args()
     main(args)

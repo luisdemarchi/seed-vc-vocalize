@@ -31,6 +31,10 @@ Mac Série M:
 pip install -r requirements-mac.txt
 ```
 
+Requisitos de sistema para I/O de áudio:
+- `ffmpeg` para reamostragem/conversão (obrigatório se você usar as flags de pré-processamento abaixo).
+- `libsndfile` (instalado automaticamente com `soundfile`).
+
 Para usuários de Windows, você pode considerar instalar `triton-windows` para habilitar o uso de `--compile`, o que acelera os modelos V2:
 ```bash
 pip install triton-windows==3.2.0.post13
@@ -77,6 +81,12 @@ onde:
 - `checkpoint`: caminho para o checkpoint do modelo se você treinou ou ajustou seu próprio modelo, deixe em branco para baixar automaticamente o modelo padrão do Hugging Face (`seed-uvit-whisper-small-wavenet` se `f0-condition` for `False`, senão `seed-uvit-whisper-base`)
 - `config`: caminho para a configuração do modelo se você treinou ou ajustou seu próprio modelo, deixe em branco para baixar automaticamente a configuração padrão do Hugging Face
 - `fp16`: flag para usar inferência em float16, padrão é True
+- `preprocess-source-ffmpeg`: se True, reamostra o source para 22.05 kHz mono via ffmpeg antes da inferência (padrão False)
+- `preprocess-target-ffmpeg`: se True, reamostra o target para 22.05 kHz mono via ffmpeg antes da inferência (padrão False)
+
+Nota:
+- A V1 depende do Descript Audio Codec (DAC). Já incluímos `descript-audio-codec==1.0.0` em `requirements-py313.txt`.
+- Se habilitar as flags de pré-processamento, garanta `ffmpeg` instalado no sistema ou use a imagem Docker fornecida (já inclui ffmpeg).
 
 ## Docker (Python 3.13, V1 padrão)
 Se preferir um runtime isolado e multiplataforma, use o Docker disponível neste repositório.
@@ -138,7 +148,7 @@ python inference_v2.py --source <audio-de-origem> \
 --ar-checkpoint-path <caminho-para-checkpoint-ar> # caminho para o checkpoint do modelo AR, deixe em branco para baixar automaticamente o modelo padrão do Hugging Face
 ```
 
-Interface Web de Conversão de Voz:
+## Interface Web de Conversão de Voz (V1)
 ```bash
 python app_vc.py --checkpoint <caminho-para-checkpoint> --config <caminho-para-config> --fp16 True
 ```
@@ -147,14 +157,14 @@ python app_vc.py --checkpoint <caminho-para-checkpoint> --config <caminho-para-c
 
 Em seguida, abra o navegador e acesse `http://localhost:7860/` para usar a interface web.
 
-Interface Web de Conversão de Voz de Canto:
+## Interface Web de Conversão de Voz de Canto (V1‑f0)
 ```bash
 python app_svc.py --checkpoint <caminho-para-checkpoint> --config <caminho-para-config> --fp16 True
 ```
 - `checkpoint`: caminho para o checkpoint do modelo se você treinou ou ajustou seu próprio modelo, deixe em branco para baixar automaticamente o modelo padrão do Hugging Face (`seed-uvit-whisper-base`)
 - `config`: caminho para a configuração do modelo se você treinou ou ajustou seu próprio modelo, deixe em branco para baixar automaticamente a configuração padrão do Hugging Face
 
-Interface Web do modelo V2:
+## Interface Web do modelo V2
 ```bash
 python app_vc_v2.py --cfm-checkpoint-path <caminho-para-checkpoint-cfm> --ar-checkpoint-path <caminho-para-checkpoint-ar>
 ```
@@ -162,7 +172,7 @@ python app_vc_v2.py --cfm-checkpoint-path <caminho-para-checkpoint-cfm> --ar-che
 - `ar-checkpoint-path`: caminho para o checkpoint do modelo AR, deixe em branco para baixar automaticamente o modelo padrão do Hugging Face
 - você pode considerar adicionar `--compile` para obter uma aceleração de ~6x na inferência do modelo AR
 
-Interface Web Integrada:
+## Interface Web Integrada
 ```bash
 python app.py --enable-v1 --enable-v2
 ```
@@ -202,7 +212,7 @@ Você pode usar o [VB-CABLE](https://vb-audio.com/Cable/) para rotear o áudio d
 
 *(A GUI e a lógica de fragmentação de áudio foram modificadas do [RVC](https://github.com/RVC-Project/Retrieval-based-Voice-Conversion-WebUI), obrigado pela implementação brilhante!)*
 
-## Treinamento🏋️
+## Treinamento (resumo)
 O fine-tuning com dados personalizados permite que o modelo clone a voz de alguém com mais precisão. Isso melhorará muito a semelhança do locutor em locutores específicos, mas pode aumentar ligeiramente a WER (Taxa de Erro de Palavra).
 Um Tutorial do Colab está aqui para você seguir: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1R1BJTqMsTXZzYAVx3j1BiemFXog9pbQG?usp=sharing)
 

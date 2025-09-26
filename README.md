@@ -29,6 +29,10 @@ Mac M Series:
 pip install -r requirements-mac.txt
 ```
 
+System requirements for audio I/O:
+- `ffmpeg` for resampling/conversion (required if you use the built-in preprocessing flags below).
+- `libsndfile` (installed automatically with `soundfile`).
+
 For Windows users, you may consider install `triton-windows` to enable `--compile` usage, which gains speed up on V2 models:
 ```bash
 pip install triton-windows==3.2.0.post13
@@ -75,48 +79,31 @@ where:
 - `checkpoint` is the path to the model checkpoint if you have trained or fine-tuned your own model, leave to blank to auto-download default model from huggingface.(`seed-uvit-whisper-small-wavenet` if `f0-condition` is `False` else `seed-uvit-whisper-base`)
 - `config` is the path to the model config if you have trained or fine-tuned your own model, leave to blank to auto-download default config from huggingface  
 - `fp16` is the flag to use float16 inference, default is True
+- `preprocess-source-ffmpeg` if True, resamples the source to 22.05 kHz mono via ffmpeg before inference (default False)
+- `preprocess-target-ffmpeg` if True, resamples the target to 22.05 kHz mono via ffmpeg before inference (default False)
 
-## Docker (Python 3.13, V1 default)
-If you prefer a cross-platform, isolated runtime, use the provided Docker setup.
+Note:
+- The V1 pipeline requires the Descript Audio Codec (DAC). We include `descript-audio-codec==1.0.0` in `requirements-py313.txt`.
+- If you enable the preprocessing flags, ensure `ffmpeg` is installed on your system or use the provided Docker image (it already includes ffmpeg).
 
-### Build image
+## Quick V1 example with preprocessing flags
 ```bash
-docker build -t seed-vc:py313 .
-```
-
-### Run V1 inference (example)
-```bash
-docker run --rm -v "$PWD:/app" seed-vc:py313 \
-  python inference.py \
-    --source examples/source/source_s1.wav \
-    --target examples/reference/s1p1.wav \
-    --output output \
-    --diffusion-steps 30 \
-    --inference-cfg-rate 0.7 \
-    --length-adjust 1.0 \
-    --f0-condition False \
-    --auto-f0-adjust False
-```
-
-### docker compose
-```bash
-docker compose build
-docker compose run --rm seed-vc \
-  python inference.py \
-    --source examples/source/source_s1.wav \
-    --target examples/reference/s1p1.wav \
-    --output output \
-    --diffusion-steps 30 \
-    --inference-cfg-rate 0.7 \
-    --length-adjust 1.0 \
-    --f0-condition False \
-    --auto-f0-adjust False
+python inference.py \
+  --source examples/source/source_s1.wav \
+  --target examples/reference/s1p1.wav \
+  --output output \
+  --diffusion-steps 30 \
+  --inference-cfg-rate 0.7 \
+  --length-adjust 1.0 \
+  --f0-condition False \
+  --auto-f0-adjust False \
+  --preprocess-source-ffmpeg True \
+  --preprocess-target-ffmpeg True
 ```
 
 Notes:
-- The image is based on Python 3.13 and installs dependencies from `requirements-py313.txt` (uses PyTorch nightly CPU index for 3.13).
-- Audio I/O handled by `soundfile`/`libsndfile`; `ffmpeg` is preinstalled for resampling/conversions.
-- Mounting the repo with `-v "$PWD:/app"` ensures outputs appear under your local `output/` directory.
+- V1 requires the Descript Audio Codec (DAC) — included in `requirements-py313.txt`.
+- If you enable the preprocessing flags, ensure `ffmpeg` is installed on your system.
 
 Similarly, to use V2 model, you can run:
 ```bash
